@@ -1,0 +1,112 @@
+diff --git a/drivers/char/tpm/tpm-dev.c b/drivers/char/tpm/tpm-dev.c
+index ebd74ab..0046165 100644
+--- a/drivers/char/tpm/tpm-dev.c
++++ b/drivers/char/tpm/tpm-dev.c
+@@ -20,11 +20,55 @@
+ #include <linux/slab.h>
+ #include "tpm-dev.h"
+ 
++
++#define TPM_IOC_TYPE 0xFE
++
++#define TPM_IOC_SET_LOCALITY_NR 0x20
++#define TPM_IOC_GET_LOCALITY_NR 0x21
++
++#define TPM_IOC_SET_LOCALITY _IOW(TPM_IOC_TYPE, TPM_IOC_SET_LOCALITY_NR, unsigned long)
++#define TPM_IOC_GET_LOCALITY _IOR(TPM_IOC_TYPE, TPM_IOC_GET_LOCALITY_NR, unsigned long)
++#define TPM_IOC_MAXNR 2
++
++static long tpm_change_locality(struct file *f, unsigned long arg)
++{
++	struct file_priv *priv = f->private_data;
++	struct tpm_chip *chip = priv->chip;
++	mutex_lock(&chip->tpm_mutex);
++	chip->locality = (int)arg;
++	mutex_unlock(&chip->tpm_mutex);
++
++	return 0;
++}
++
++
++
++static long tpm_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
++{
++	struct file_priv *priv = f->private_data;
++	struct tpm_chip *chip = priv->chip;
++	printk(KERN_NOTICE "tpm_ioctl cmd: 0x%x\n", cmd);
++
++	switch (cmd)
++	{
++		case TPM_IOC_SET_LOCALITY:
++			return tpm_change_locality(f, arg);
++		case TPM_IOC_GET_LOCALITY:
++			return (long)chip->locality;
++		default:
++			return -ENOIOCTLCMD;
++	}
++
++	
++	return 0;
++}
++
+ static int tpm_open(struct inode *inode, struct file *file)
+ {
+ 	struct tpm_chip *chip;
+ 	struct file_priv *priv;
+ 
++
+ 	chip = container_of(inode->i_cdev, struct tpm_chip, cdev);
+ 
+ 	/* It's assured that the chip will be opened just once,
+@@ -34,6 +78,7 @@ static int tpm_open(struct inode *inode, struct file *file)
+ 		dev_dbg(&chip->dev, "Another process owns this TPM\n");
+ 		return -EBUSY;
+ 	}
++	printk(KERN_NOTICE "tpm open.\n");
+ 
+ 	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+ 	if (priv == NULL)
+@@ -75,4 +120,5 @@ static int tpm_release(struct inode *inode, struct file *file)
+ 	.read = tpm_common_read,
+ 	.write = tpm_write,
+ 	.release = tpm_release,
++	.unlocked_ioctl = tpm_ioctl,
+ };
+diff --git a/drivers/char/tpm/tpm_crb.c b/drivers/char/tpm/tpm_crb.c
+index 7f78482..7671e48 100644
+--- a/drivers/char/tpm/tpm_crb.c
++++ b/drivers/char/tpm/tpm_crb.c
+@@ -310,11 +310,13 @@ static int crb_do_acpi_start(struct tpm_chip *chip)
+  * Secure Monitor Call to requrest the firmware to execute or cancel
+  * a TPM 2.0 command.
+  */
+-static int tpm_crb_smc_start(struct device *dev, unsigned long func_id)
++static int tpm_crb_smc_start(int locality, struct device *dev, unsigned long func_id)
+ {
+ 	struct arm_smccc_res res;
++	
++    printk(KERN_NOTICE "locality: %d\n", locality);
+ 
+-	arm_smccc_smc(func_id, 0, 0, 0, 0, 0, 0, 0, &res);
++	arm_smccc_smc(func_id, locality, 0, 0, 0, 0, 0, 0, &res);
+ 	if (res.a0 != 0) {
+ 		dev_err(dev,
+ 			FW_BUG "tpm_crb_smc_start() returns res.a0 = 0x%lx\n",
+@@ -368,7 +370,7 @@ static int crb_send(struct tpm_chip *chip, u8 *buf, size_t len)
+ 
+ 	if (priv->sm == ACPI_TPM2_COMMAND_BUFFER_WITH_ARM_SMC) {
+ 		iowrite32(CRB_START_INVOKE, &priv->regs_t->ctrl_start);
+-		rc = tpm_crb_smc_start(&chip->dev, priv->smc_func_id);
++		rc = tpm_crb_smc_start(chip->locality, &chip->dev, priv->smc_func_id);
+ 	}
+ 
+ 	return rc;
+@@ -580,6 +582,8 @@ static int crb_acpi_add(struct acpi_device *device)
+ 	acpi_status status;
+ 	u32 sm;
+ 	int rc;
++	
++	printk(KERN_NOTICE "lihui test \n");
+ 
+ 	status = acpi_get_table(ACPI_SIG_TPM2, 1,
+ 				(struct acpi_table_header **) &buf);
