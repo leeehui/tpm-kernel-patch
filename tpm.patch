@@ -1,20 +1,25 @@
 diff --git a/drivers/char/tpm/tpm-dev.c b/drivers/char/tpm/tpm-dev.c
-index ebd74ab..0046165 100644
+index ebd74ab..8b287d0 100644
 --- a/drivers/char/tpm/tpm-dev.c
 +++ b/drivers/char/tpm/tpm-dev.c
-@@ -20,11 +20,55 @@
+@@ -20,11 +20,101 @@
  #include <linux/slab.h>
  #include "tpm-dev.h"
  
++#ifdef CONFIG_ARM64
++#include <linux/arm-smccc.h>
++#endif
 +
 +#define TPM_IOC_TYPE 0xFE
 +
 +#define TPM_IOC_SET_LOCALITY_NR 0x20
 +#define TPM_IOC_GET_LOCALITY_NR 0x21
++#define TPM_IOC_SKM_DELETE_KEY_SLOT_NR 0x22
 +
 +#define TPM_IOC_SET_LOCALITY _IOW(TPM_IOC_TYPE, TPM_IOC_SET_LOCALITY_NR, unsigned long)
 +#define TPM_IOC_GET_LOCALITY _IOR(TPM_IOC_TYPE, TPM_IOC_GET_LOCALITY_NR, unsigned long)
-+#define TPM_IOC_MAXNR 2
++#define TPM_IOC_SKM_DELETE_KEY_SLOT  _IOW(TPM_IOC_TYPE, TPM_IOC_SKM_DELETE_KEY_SLOT_NR, unsigned long)
++#define TPM_IOC_MAXNR 3
 +
 +static long tpm_change_locality(struct file *f, unsigned long arg)
 +{
@@ -27,6 +32,43 @@ index ebd74ab..0046165 100644
 +	return 0;
 +}
 +
++#define CMD_SKM_DELETE_KEY_SLOT 1
++static int tpm_crb_smc_start_skm_cmd(int locality, struct device *dev, unsigned long func_id, unsigned long cmd)
++{
++	struct arm_smccc_res res;
++	
++    printk(KERN_NOTICE "locality: %d\n", locality);
++
++	arm_smccc_smc(func_id, locality, cmd, 0, 0, 0, 0, 0, &res);
++	if (res.a0 != 0) {
++		dev_err(dev,
++			FW_BUG "tpm_crb_smc_start_skm_cmd() returns res.a0 = 0x%lx\n",
++			res.a0);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++u32 g_smc_func_id;
++EXPORT_SYMBOL(g_smc_func_id);
++static int tpm_handle_skm_delete_kwk_slot(struct file *f, unsigned long arg)
++{
++    int ret;
++	struct file_priv *priv = f->private_data;
++	struct tpm_chip *chip = priv->chip;
++
++    unsigned long cmd = (arg << 32) | CMD_SKM_DELETE_KEY_SLOT; 
++    printk(KERN_NOTICE "tpm_handle_skm_delete_kwk_slot: 0x%lx \n", cmd);
++
++    printk(KERN_NOTICE "g_smc_func_id: 0x%x \n", g_smc_func_id);
++
++	mutex_lock(&chip->tpm_mutex);
++    ret = tpm_crb_smc_start_skm_cmd(chip->locality, &chip->dev, g_smc_func_id, cmd);
++	mutex_unlock(&chip->tpm_mutex);
++
++    return ret;
++}
 +
 +
 +static long tpm_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
@@ -35,12 +77,16 @@ index ebd74ab..0046165 100644
 +	struct tpm_chip *chip = priv->chip;
 +	printk(KERN_NOTICE "tpm_ioctl cmd: 0x%x\n", cmd);
 +
++    /* Note: arg is NOT used as address of usr space, so there is no need to copy_from_user */
++
 +	switch (cmd)
 +	{
 +		case TPM_IOC_SET_LOCALITY:
 +			return tpm_change_locality(f, arg);
 +		case TPM_IOC_GET_LOCALITY:
 +			return (long)chip->locality;
++        case TPM_IOC_SKM_DELETE_KEY_SLOT:
++			return tpm_handle_skm_delete_kwk_slot(f, arg);
 +		default:
 +			return -ENOIOCTLCMD;
 +	}
@@ -58,7 +104,7 @@ index ebd74ab..0046165 100644
  	chip = container_of(inode->i_cdev, struct tpm_chip, cdev);
  
  	/* It's assured that the chip will be opened just once,
-@@ -34,6 +78,7 @@ static int tpm_open(struct inode *inode, struct file *file)
+@@ -34,6 +124,7 @@ static int tpm_open(struct inode *inode, struct file *file)
  		dev_dbg(&chip->dev, "Another process owns this TPM\n");
  		return -EBUSY;
  	}
@@ -66,14 +112,14 @@ index ebd74ab..0046165 100644
  
  	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
  	if (priv == NULL)
-@@ -75,4 +120,5 @@ static int tpm_release(struct inode *inode, struct file *file)
+@@ -75,4 +166,5 @@ static int tpm_release(struct inode *inode, struct file *file)
  	.read = tpm_common_read,
  	.write = tpm_write,
  	.release = tpm_release,
 +	.unlocked_ioctl = tpm_ioctl,
  };
 diff --git a/drivers/char/tpm/tpm_crb.c b/drivers/char/tpm/tpm_crb.c
-index 7f78482..7671e48 100644
+index 7f78482..3b0b023 100644
 --- a/drivers/char/tpm/tpm_crb.c
 +++ b/drivers/char/tpm/tpm_crb.c
 @@ -310,11 +310,13 @@ static int crb_do_acpi_start(struct tpm_chip *chip)
@@ -92,7 +138,15 @@ index 7f78482..7671e48 100644
  	if (res.a0 != 0) {
  		dev_err(dev,
  			FW_BUG "tpm_crb_smc_start() returns res.a0 = 0x%lx\n",
-@@ -368,7 +370,7 @@ static int crb_send(struct tpm_chip *chip, u8 *buf, size_t len)
+@@ -324,6 +326,7 @@ static int tpm_crb_smc_start(struct device *dev, unsigned long func_id)
+ 
+ 	return 0;
+ }
++
+ #else
+ static int tpm_crb_smc_start(struct device *dev, unsigned long func_id)
+ {
+@@ -368,7 +371,7 @@ static int crb_send(struct tpm_chip *chip, u8 *buf, size_t len)
  
  	if (priv->sm == ACPI_TPM2_COMMAND_BUFFER_WITH_ARM_SMC) {
  		iowrite32(CRB_START_INVOKE, &priv->regs_t->ctrl_start);
@@ -101,7 +155,16 @@ index 7f78482..7671e48 100644
  	}
  
  	return rc;
-@@ -580,6 +582,8 @@ static int crb_acpi_add(struct acpi_device *device)
+@@ -570,6 +573,8 @@ static int crb_map_io(struct acpi_device *device, struct crb_priv *priv,
+ 	return ret;
+ }
+ 
++extern u32 g_smc_func_id;
++
+ static int crb_acpi_add(struct acpi_device *device)
+ {
+ 	struct acpi_table_tpm2 *buf;
+@@ -580,6 +585,8 @@ static int crb_acpi_add(struct acpi_device *device)
  	acpi_status status;
  	u32 sm;
  	int rc;
@@ -110,3 +173,11 @@ index 7f78482..7671e48 100644
  
  	status = acpi_get_table(ACPI_SIG_TPM2, 1,
  				(struct acpi_table_header **) &buf);
+@@ -607,6 +614,7 @@ static int crb_acpi_add(struct acpi_device *device)
+ 		}
+ 		crb_smc = ACPI_ADD_PTR(struct tpm2_crb_smc, buf, sizeof(*buf));
+ 		priv->smc_func_id = crb_smc->smc_func_id;
++		g_smc_func_id = crb_smc->smc_func_id;
+ 	}
+ 
+ 	priv->sm = sm;
